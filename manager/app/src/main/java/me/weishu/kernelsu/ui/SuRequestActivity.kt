@@ -37,7 +37,9 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import me.weishu.kernelsu.Natives
+import androidx.compose.runtime.CompositionLocalProvider
 import me.weishu.kernelsu.ui.theme.KernelSUTheme
+import me.weishu.kernelsu.ui.theme.LocalColorMode
 import me.weishu.kernelsu.ui.util.execKsud
 
 private const val TAG = "SuRequest"
@@ -72,14 +74,19 @@ class SuRequestActivity : ComponentActivity() {
         val appKey = pkg ?: "uid:$uid"
 
         setContent {
-            KernelSUTheme {
-                SuRequestScreen(
-                    appLabel = appLabel,
-                    packageName = appKey,
-                    appIcon = appIcon,
-                    onGrant = { decide(true, appKey) },
-                    onDeny = { decide(false, appKey) },
-                )
+            // Force dark palette for the popup regardless of system/manager
+            // color-mode preference. The light scheme is too bright over the
+            // app that triggered the request.
+            CompositionLocalProvider(LocalColorMode provides 2) {
+                KernelSUTheme {
+                    SuRequestScreen(
+                        appLabel = appLabel,
+                        packageName = appKey,
+                        appIcon = appIcon,
+                        onGrant = { decide(true, appKey) },
+                        onDeny = { decide(false, appKey) },
+                    )
+                }
             }
         }
     }
