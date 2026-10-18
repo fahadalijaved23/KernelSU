@@ -1,7 +1,24 @@
-# Shell scripts and gradle wrapper must be LF or the Linux CI dies on
-# "./gradlew: cannot execute: required file not found" (shebang reads
-# /bin/sh\r if the file was checked out CRLF on Windows).
+# Normalize everything to LF in the repo. Windows checkouts can still get
+# CRLF locally (core.autocrlf) but the stored blob stays LF, which is the
+# only thing the Linux CI runners care about. Previously push-triggered
+# Build Manager failed with "./gradlew: cannot execute: required file not
+# found" because gradlew's '#!/bin/sh' shebang had been committed as
+# '#!/bin/sh\r' - every push after the Windows-side popup commit broke.
+* text=auto eol=lf
+
+# Scripts and the gradle wrapper MUST be LF; the interpreter line is read
+# as bytes and \r breaks the shebang.
 gradlew text eol=lf
 *.sh text eol=lf
+
+# Binary artifacts - never let git touch EOLs.
 *.ko binary
 *.so binary
+*.apk binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.jks binary
+*.p12 binary
