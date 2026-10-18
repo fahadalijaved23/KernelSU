@@ -387,9 +387,13 @@ void __init ksu_sucompat_init()
     if (ksu_register_feature_handler(&su_compat_handler)) {
         pr_err("Failed to register su_compat feature handler\n");
     }
+    if (ksu_register_feature_handler(&su_request_handler)) {
+        pr_err("Failed to register su_request feature handler\n");
+    }
 }
 
 void __exit ksu_sucompat_exit()
 {
     ksu_unregister_feature_handler(KSU_FEATURE_SU_COMPAT);
+    ksu_unregister_feature_handler(KSU_FEATURE_SU_REQUEST);
 }

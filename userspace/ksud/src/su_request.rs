@@ -221,10 +221,27 @@ fn launch_prompt(reqid: u64, uid: u32, pid: i32) -> Result<()> {
 // Request client (called from su::root_shell when KSU_SU_REQUEST is set)
 // ---------------------------------------------------------------------------
 
+fn connect_to_daemon() -> Result<UnixStream> {
+    let path = socket_path();
+    // Fast path: daemon already running.
+    if let Ok(s) = UnixStream::connect(&path) {
+        return Ok(s);
+    }
+    // Daemon not yet running; start it and wait up to 2 s.
+    spawn_sudaemon()?;
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(100));
+        if let Ok(s) = UnixStream::connect(&path) {
+            return Ok(s);
+        }
+    }
+    UnixStream::connect(&path).context("connect to sudaemon after spawn")
+}
+
 /// Ask the daemon for a decision. Returns true if the user allowed root.
 pub fn request_decision(uid: u32) -> Result<bool> {
     let pid = std::process::id();
-    let mut stream = UnixStream::connect(socket_path()).context("connect to sudaemon")?;
+    let mut stream = connect_to_daemon().context("connect to sudaemon")?;
     stream
         .set_read_timeout(Some(DECISION_TIMEOUT + Duration::from_secs(5)))
         .ok();
