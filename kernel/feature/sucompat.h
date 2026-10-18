@@ -4,6 +4,11 @@
 #include <linux/types.h>
 
 extern bool ksu_su_compat_enabled;
+extern bool ksu_su_request_enabled;
+
+// Whether a not-yet-configured app process should be traced so its su call
+// can be turned into a root request for the manager.
+bool ksu_su_request_should_trace(uid_t uid);
 
 void ksu_sucompat_init(void);
 void ksu_sucompat_exit(void);

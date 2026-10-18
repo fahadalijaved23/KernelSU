@@ -170,6 +170,11 @@ pub fn on_services() {
 
     info!("on_services triggered!");
     run_stage("service", ScriptWait::NoWait);
+
+    // Start the su-request broker so apps without a profile can prompt for root.
+    if let Err(e) = crate::su_request::ensure_sudaemon_running() {
+        warn!("failed to start su-request daemon: {e:#}");
+    }
 }
 
 pub fn on_boot_completed() {

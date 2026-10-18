@@ -14,6 +14,7 @@ static DEFINE_MUTEX(feature_mutex);
 static const char *const feature_names[KSU_FEATURE_MAX] = {
     [KSU_FEATURE_SU_COMPAT] = "su_compat", [KSU_FEATURE_KERNEL_UMOUNT] = "kernel_umount", [KSU_FEATURE_SULOG] = "sulog",
     [KSU_FEATURE_ADB_ROOT] = "adb_root",   [KSU_FEATURE_SELINUX_HIDE] = "selinux_hide",
+    [KSU_FEATURE_SU_REQUEST] = "su_request",
 };
 
 // Features forced by boot config. Written only while parsing module params

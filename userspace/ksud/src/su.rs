@@ -106,9 +106,42 @@ fn wrap_tty(fd: c_int) {
     }
 }
 
+/// Request path: ask the broker daemon (which drives the manager popup) whether
+/// this app may become root. On allow, re-exec the real `su` so it takes the
+/// normal granted path (the manager has set the app profile by now); on deny,
+/// exit without ever starting the caller's shell.
+fn handle_su_request(uid_str: &str) -> Result<()> {
+    let uid: u32 = uid_str
+        .parse()
+        .with_context(|| format!("invalid KSU_SU_REQUEST uid: {uid_str}"))?;
+
+    // Never let this marker survive into the shell or a re-exec; it would loop.
+    unsafe { env::remove_var("KSU_SU_REQUEST") };
+
+    let allow = crate::su_request::request_decision(uid).unwrap_or(false);
+    if !allow {
+        eprintln!("{}: permission denied", env::args().next().unwrap_or_default());
+        std::process::exit(1);
+    }
+
+    // Re-exec the real su. We are root in the KernelSU domain, so the kernel
+    // routes it through the normal granted path (installs the session fd, etc.).
+    let args: Vec<String> = env::args().skip(1).collect();
+    let mut command = Command::new("/system/bin/su");
+    command.args(&args).arg0("su");
+    Err(command.exec().into())
+}
+
 #[allow(clippy::similar_names)]
 pub fn root_shell() -> Result<()> {
     // The kernel has already applied the selected root profile.
+
+    // su-request path: the caller has no app profile yet. The kernel routed su
+    // here (as root, sanitized env) WITHOUT granting the app. Ask the manager,
+    // via the broker daemon, before anything else.
+    if let std::result::Result::Ok(uid_str) = env::var("KSU_SU_REQUEST") {
+        return handle_su_request(&uid_str);
+    }
 
     // A su-session driver fd deliberately survives the exec into ksud. Claim
     // it before handling any arguments and restore FD_CLOEXEC so it cannot

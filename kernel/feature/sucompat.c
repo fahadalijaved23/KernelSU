@@ -23,6 +23,7 @@
 #include "feature/sucompat.h"
 #include "policy/app_profile.h"
 #include "hook/syscall_hook.h"
+#include "hook/tp_marker.h"
 #include "supercall/supercall.h"
 #include "sulog/event.h"
 #include "ksu.h"
@@ -54,6 +55,64 @@ static const struct ksu_feature_handler su_compat_handler = {
     .set_handler = su_compat_feature_set,
 };
 
+// su_request: an app that has no app profile yet (never granted nor denied)
+// can still see su. Executing it starts ksud in request mode, which asks the
+// manager and only hands out a root shell after the user allows it.
+bool ksu_su_request_enabled __read_mostly = true;
+
+static int su_request_feature_get(u64 *value)
+{
+    *value = ksu_su_request_enabled ? 1 : 0;
+    return 0;
+}
+
+static int su_request_feature_set(u64 value)
+{
+    bool enable = value != 0;
+    ksu_su_request_enabled = enable;
+    pr_info("su_request: set to %d\n", enable);
+    ksu_mark_running_process();
+    return 0;
+}
+
+static const struct ksu_feature_handler su_request_handler = {
+    .feature_id = KSU_FEATURE_SU_REQUEST,
+    .name = "su_request",
+    .get_handler = su_request_feature_get,
+    .set_handler = su_request_feature_set,
+};
+
+// Cheap per-syscall gate: no allowlist lookup. Safe to use inside the syscall
+// hooks because marking (ksu_su_request_should_trace) has already ensured only
+// allowed apps and genuine candidates are traced at all. A traced app UID that
+// is not currently allowed and hits this gate is, by construction, a candidate.
+static inline bool su_request_gate(uid_t uid)
+{
+    return ksu_su_request_enabled && ksu_su_compat_enabled && is_appuid(uid);
+}
+
+// Authoritative check used at marking time only (app spawn / profile change /
+// feature toggle), so the per-app allowlist lookup is off the syscall fast path.
+// A candidate is an app that has no app profile yet - neither granted nor denied.
+bool ksu_su_request_should_trace(uid_t uid)
+{
+    struct app_profile *profile;
+
+    if (!su_request_gate(uid))
+        return false;
+
+    rcu_read_lock();
+    profile = ksu_get_app_profile(uid);
+    rcu_read_unlock();
+
+    if (profile) {
+        ksu_put_app_profile(profile);
+        return false;
+    }
+    return true;
+}
+
+
 static void __user *userspace_stack_buffer(const void *d, size_t len)
 {
     // To avoid having to mmap a page in userspace, just write below the stack
@@ -75,6 +134,37 @@ static char __user *empty_user_path(void)
     return userspace_stack_buffer("", sizeof(""));
 }
 
+#define SU_REQUEST_ENV "KSU_SU_REQUEST="
+
+struct su_request_stack {
+    u64 envp[2];
+    char empty_path[8];
+    char env[sizeof(SU_REQUEST_ENV) + 16];
+};
+
+// Build, below the user stack pointer, an empty path for execveat and an
+// environment holding only KSU_SU_REQUEST=<uid>. The app's own environment is
+// dropped on purpose: ksud runs as root before the user has answered, so
+// nothing like LD_PRELOAD may reach it.
+static bool su_request_user_args(uid_t uid, char __user **path_user, unsigned long *envp_user)
+{
+    struct su_request_stack buf;
+    struct su_request_stack __user *p;
+
+    memset(&buf, 0, sizeof(buf));
+    snprintf(buf.env, sizeof(buf.env), SU_REQUEST_ENV "%u", uid);
+
+    p = (void __user *)((current_user_stack_pointer() - sizeof(buf)) & ~15UL);
+    buf.envp[0] = (u64)(unsigned long)p->env;
+    buf.envp[1] = 0;
+    if (copy_to_user(p, &buf, sizeof(buf)))
+        return false;
+
+    *path_user = p->empty_path;
+    *envp_user = (unsigned long)p->envp;
+    return true;
+}
+
 static const char su_path[] = SU_PATH;
 
 static bool is_ksud_exists()
@@ -94,7 +184,8 @@ long ksu_handle_faccessat_sucompat(int orig_nr, struct pt_regs *regs)
     long ret;
     const struct cred *old_cred;
 
-    if (!ksu_is_allow_uid_for_current(current_uid().val)) {
+    if (!ksu_is_allow_uid_for_current(current_uid().val) &&
+        !su_request_gate(current_uid().val)) {
         goto do_orig_facessat;
     }
 
@@ -129,7 +220,8 @@ long ksu_handle_stat_sucompat(int orig_nr, struct pt_regs *regs)
     long ret;
     const struct cred *old_cred;
 
-    if (!ksu_is_allow_uid_for_current(current_uid().val)) {
+    if (!ksu_is_allow_uid_for_current(current_uid().val) &&
+        !su_request_gate(current_uid().val)) {
         goto do_orig_stat;
     }
 
@@ -171,6 +263,9 @@ static long ksu_handle_execve_sucompat_common(const char __user **filename_user,
     int tmp_fd;
     struct file *ksud_file;
     const struct cred *old_cred;
+    bool su_request = false;
+    char __user *exec_path_user;
+    unsigned long exec_envp = envp;
 
     if (execveat && ((int)PT_REGS_SYSCALL_PARM1(regs) != AT_FDCWD || (int)PT_REGS_PARM5(regs) != 0))
         goto do_orig_execve;
@@ -178,8 +273,11 @@ static long ksu_handle_execve_sucompat_common(const char __user **filename_user,
     if (unlikely(!filename_user))
         goto do_orig_execve;
 
-    if (!ksu_is_allow_uid_for_current(current_uid().val))
-        goto do_orig_execve;
+    if (!ksu_is_allow_uid_for_current(current_uid().val)) {
+        if (!su_request_gate(current_uid().val))
+            goto do_orig_execve;
+        su_request = true;
+    }
 
     addr = untagged_addr((unsigned long)*filename_user);
     fn = (const char __user *)addr;
@@ -195,7 +293,7 @@ static long ksu_handle_execve_sucompat_common(const char __user **filename_user,
     if (likely(memcmp(path, su_path, sizeof(su_path))))
         goto do_orig_execve;
 
-    pr_info("sys_execve su found\n");
+    pr_info("sys_execve su found%s\n", su_request ? " (request)" : "");
 
     tmp_fd = get_unused_fd_flags(O_CLOEXEC);
     if (tmp_fd < 0) {
@@ -214,6 +312,15 @@ static long ksu_handle_execve_sucompat_common(const char __user **filename_user,
 
     fd_install(tmp_fd, ksud_file);
 
+    if (su_request) {
+        if (!su_request_user_args(current_uid().val, &exec_path_user, &exec_envp)) {
+            ksu_close_fd(tmp_fd);
+            goto do_orig_execve;
+        }
+    } else {
+        exec_path_user = empty_user_path();
+    }
+
     pending_sucompat = ksu_sulog_capture_sucompat(*filename_user, argv_user, GFP_KERNEL);
     // execve(file, argv, environ)
     // execveat(fd, file, argv, environ, flags)
@@ -223,11 +330,16 @@ static long ksu_handle_execve_sucompat_common(const char __user **filename_user,
     orig_regs[3] = regs->__PT_SYSCALL_PARM4_REG;
     orig_regs[4] = regs->__PT_PARM5_REG;
     regs->__PT_PARM5_REG = AT_EMPTY_PATH;
-    regs->__PT_SYSCALL_PARM4_REG = envp;
+    regs->__PT_SYSCALL_PARM4_REG = exec_envp;
     regs->__PT_PARM3_REG = (unsigned long)argv_user;
-    regs->__PT_PARM2_REG = empty_user_path();
+    regs->__PT_PARM2_REG = (unsigned long)exec_path_user;
     PT_REGS_SYSCALL_PARM1(regs) = tmp_fd;
 
+    // Apply the root profile so ksud can reach the root su-request daemon.
+    // The app itself is NOT added to the allowlist here; ksud only gets root
+    // to run its own (trusted) request code with a sanitized environment, asks
+    // the manager, and re-execs su once the user allows it. Nothing of the
+    // app's own code runs with these privileges.
     ret = escape_with_root_profile();
     if (ret) {
         pr_err("escape_with_root_profile failed: %ld\n", ret);
@@ -242,9 +354,10 @@ static long ksu_handle_execve_sucompat_common(const char __user **filename_user,
         regs->__PT_PARM3_REG = orig_regs[2];
         regs->__PT_SYSCALL_PARM4_REG = orig_regs[3];
         regs->__PT_PARM5_REG = orig_regs[4];
-    } else {
-        // Only grant the scoped driver capability after the selected root
-        // profile has been applied successfully.
+    } else if (!su_request) {
+        // Only grant the scoped driver session fd to a genuinely allowed app.
+        // A pending request gets no session fd; ksud re-execs su once the user
+        // allows it, which then takes this normal path.
         su_fd = ksu_install_su_fd();
         if (su_fd < 0) {
             pr_warn("install su session fd failed: %d\n", su_fd);
