@@ -1,1 +1,7 @@
-*.bat eol=crlf
+# Shell scripts and gradle wrapper must be LF or the Linux CI dies on
+# "./gradlew: cannot execute: required file not found" (shebang reads
+# /bin/sh\r if the file was checked out CRLF on Windows).
+gradlew text eol=lf
+*.sh text eol=lf
+*.ko binary
+*.so binary
